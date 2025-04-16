@@ -1,3 +1,14 @@
+# Ignore all JSON files
+*.json
+
+# Ignore all TXT files
+*.txt*
+
+# Ignore all files starting with "txt"
+txt*
+
+# Ignore all files and folders inside the __pycache__ directory
+__pycache__/*
+
+# Ignore only the config.ini file
 config.ini
-torrent_ratio_log.json
-deletelog.txt
