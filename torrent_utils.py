@@ -1,17 +1,18 @@
 import os
 import sys
-import platform
 from shutil import disk_usage
 import requests
 import json
 import configparser
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Tuple
 from logging import Logger
-
+from numbers import Number
+from torrent_fields_types import TORRENT_FIELDS_TYPES
 # Constants
 API_V2_BASE = "/api/v2"
 BYTES_TO_GB = 1024**3
-SECONDS_PER_WEEK = 7 * 86400
+SECONDS_PER_DAY = 86400
+SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY
 
 def get_drive_path(file_path: str) -> str:
     """Find the mount point of a given file path."""
@@ -23,6 +24,10 @@ def get_drive_path(file_path: str) -> str:
 def get_free_space(drive_path: str) -> float:
     """Get free space on a given drive in GB."""
     return disk_usage(drive_path).free / BYTES_TO_GB
+
+def parse_free_space(free_space: int) -> float:
+    """Convert free space from bytes to GB."""
+    return free_space / BYTES_TO_GB
 
 def load_configuration(script_directory: str) -> configparser.ConfigParser:
     """Load configuration from the config file."""
@@ -49,6 +54,28 @@ def get_torrent_list(session: requests.Session, api_address: str, logger: Logger
     response = session.get(torrent_list_url)
     response.raise_for_status()  # This will raise an HTTPError for bad responses
     return response.json()
+
+def get_status(session: requests.Session, api_address: str, logger: Logger) -> Dict[str, Any]:
+    """Get qBittorrent status."""
+    status_url = f"{api_address}{API_V2_BASE}/sync/maindata"
+    response = session.get(status_url)
+    response.raise_for_status()
+    return response.json()
+
+def force_torrents(session: requests.Session, api_address: str, torrents: List[Dict[str, Any]], logger: Logger, test_mode: bool) -> None:
+    """Force torrents to seed."""
+    force_url = f"{api_address}{API_V2_BASE}/torrents/setForceStart"
+    hashList = '|'.join(torrent['hash'] for torrent in torrents)
+    if not test_mode:
+        data = {'hashes': hashList, 'value': 'true'}
+        response = session.post(force_url, data=data)
+        response.raise_for_status()
+        logger.info(f"Torrents {hashList} forced to seed.")
+    else:
+        for torrent in torrents:
+
+            logger.info(f"Test mode: Would force torrent {torrent['name']} in category {torrent['category']} to seed.")
+        logger.info(f"Test mode: Would force torrents {hashList} to seed.")
 
 def load_ratio_log(log_file_path: str) -> Dict[str, List[Dict[str, Any]]]:
     """Load ratio log from file."""
@@ -141,15 +168,21 @@ def calculate_average_ratio(torrent: Dict[str, Any], log_file_path: str, logger:
 
     return average_ratio_change
 
-def get_category_rules(config: configparser.ConfigParser) -> Dict[str, Dict[str, float]]:
+def get_category_rules(config: configparser.ConfigParser, logger: Logger) -> Dict[str, Dict[str, float]]:
     """Get seed time and ratio rules for each category."""
     rules = {}
     for category, rule_string in config['seed_rules'].items():
         category_rules = {}
         for rule in rule_string.split(', '):
             key, value = rule.split(':')
-            if key in ['min_seed_time', 'min_ratio']:
-                category_rules[key] = float(value)
+            key, value = key.strip(), value.strip()
+            if key in TORRENT_FIELDS_TYPES:
+                try:
+                    category_rules[key] = TORRENT_FIELDS_TYPES[key](value)
+                except ValueError:
+                    logger.error(f"Invalid value for '{key}' in category '{category}': {value}")
+            else:
+                logger.error(f"Unknown field '{key}' in category '{category}'")
         if category_rules:  # Only add the category if it has any rules
             rules[category.lower()] = category_rules
     return rules
@@ -157,21 +190,44 @@ def get_category_rules(config: configparser.ConfigParser) -> Dict[str, Dict[str,
 def filter_torrents_by_rules(torrents: List[Dict[str, Any]], category_rules: Dict[str, Dict[str, float]], logger: Logger) -> List[Dict[str, Any]]:
     filtered_torrents = []
     for torrent in torrents:
+        logger.debug(f"Processing torrent: {torrent['name']}")
         category = torrent.get('category', '').lower()
         if category in category_rules:
             rules = category_rules[category]
-            min_seed_time = rules.get('min_seed_time')
-            min_ratio = rules.get('min_ratio')
-            
-            seed_time_met = min_seed_time is not None and torrent['seeding_time'] >= min_seed_time
-            ratio_met = min_ratio is not None and torrent['ratio'] >= min_ratio
-            
-            if seed_time_met or ratio_met:
+
+            conditions_met: bool = True
+            for category_name, category_value in rules.items():
+                if category_name not in TORRENT_FIELDS_TYPES:
+                    logger.error(f"Unknown field '{category_name}' in category '{category}'")
+                    continue
+                else:
+                    logger.debug(f"Checking torrent {torrent['name']} in category '{category}' with rules: {rules}")
+                    logger.debug(f"Field '{category_name}' with field type '{type(category_value)}' is valid for category '{category}'")
+                    
+                    if isinstance(category_value, Number):
+                        match category_name:
+                            case 'popularity':
+                                conditions_met = conditions_met and (torrent[category_name] < category_value)
+                            case 'eta':
+                                conditions_met = conditions_met and (torrent[category_name] == category_value)
+                            case _:
+                                conditions_met = conditions_met and (torrent[category_name] >= category_value)
+
+                    elif isinstance(type(category_value), str):
+                        conditions_met = conditions_met and (category_value in torrent[category_name])
+                    elif isinstance(type(category_value), bool):
+                        conditions_met = conditions_met and torrent[category_name]
+
+                    logger.debug(f"Torrent {torrent['name']} condition {conditions_met} at {category_name}"
+                                 f"with torrent value {torrent[category_name]} and category expectation {category_value}")
+
+            if conditions_met:
                 filtered_torrents.append(torrent)
                 logger.debug(f"Torrent {torrent['name']} eligible for removal: "
-                             f"category: {category}, "
-                             f"seed time: {torrent['seeding_time']} >= {min_seed_time if min_seed_time is not None else 'N/A'}, "
-                             f"ratio: {torrent['ratio']} >= {min_ratio if min_ratio is not None else 'N/A'}")
+                            f"category: {category}, "
+                            f"seed time: {torrent['seeding_time']}, "
+                            f"ratio: {torrent['ratio']} "
+                            f"tracker: {torrent['tracker']}")
         else:
             logger.debug(f"No rules for category: {category}")
     
@@ -199,7 +255,10 @@ def remove_torrents_by_space(torrents: List[Dict[str, Any]], categories_space: L
     for torrent in torrents_in_categories:
         torrent['average_ratio'] = calculate_average_ratio(torrent, log_file_path, logger, bonus_rules, config)
 
-    torrents_sorted = sorted(torrents_in_categories, key=lambda t: (t['average_ratio'], -t['seeding_time'], -t['size'], t['name']))
+    if config.getboolean('cleanup', 'prefer_qbittorrent_ratio', fallback=False):
+        torrents_sorted = sorted(torrents_in_categories, key=lambda t: (t['popularity'], -t['seeding_time'], -t['size'], t['name']))
+    else: # This is the original ration-based sorting
+        torrents_sorted = sorted(torrents_in_categories, key=lambda t: (t['average_ratio'], -t['seeding_time'], -t['size'], t['name']))
 
     for torrent in torrents_sorted:
         if space_freed >= space_needed:
@@ -210,14 +269,17 @@ def remove_torrents_by_space(torrents: List[Dict[str, Any]], categories_space: L
             'size': torrent['size'],
             'seeding_time': torrent['seeding_time'],
             'ratio': torrent['ratio'],
-            'category': torrent['category']
+            'category': torrent['category'],
+            'popularity': torrent['popularity'],
+            'eta': torrent['eta'],
+            'tracker': torrent['tracker']
         }
         if not test_mode:
             remove_torrent(session, api_address, torrent['hash'], True, logger)
         space_freed += torrent['size'] / BYTES_TO_GB
         torrents_removed_info.append(torrent_info)
 
-    return torrents_removed_info
+    return torrents_removed_info, space_freed
 
 def remove_torrents_by_count(torrents: List[Dict[str, Any]], categories_number: List[str], max_torrents: int, 
                              logger: Logger, session: requests.Session, api_address: str, test_mode: bool,
@@ -248,7 +310,10 @@ def remove_torrents_by_count(torrents: List[Dict[str, Any]], categories_number: 
                     'size': torrent['size'],
                     'seeding_time': torrent['seeding_time'],
                     'ratio': torrent['ratio'],
-                    'category': torrent['category']
+                    'category': torrent['category'],
+                    'popularity': torrent['popularity'],
+                    'eta': torrent['eta'],
+                    'tracker': torrent['tracker']
                 }
                 torrents_removed_info.append(torrent_info)
         

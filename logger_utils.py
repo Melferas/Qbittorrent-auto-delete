@@ -12,6 +12,7 @@ SEPARATOR_LENGTH = 127
 MAX_NAME_LENGTH = 69
 BYTES_TO_GB = 1024 ** 3
 SECONDS_PER_WEEK = 7 * 86400
+SECONDS_PER_DAY = 86400
 
 class PrependingRotatingFileHandler(RotatingFileHandler):
     def __init__(self, *args, **kwargs):
@@ -44,8 +45,8 @@ class PrependingRotatingFileHandler(RotatingFileHandler):
                 self.log_entries = []
                 self.first_entry = True
 
-def setup_logger(log_file_name: str = 'deletelog.txt') -> Tuple[logging.Logger, PrependingRotatingFileHandler]:
-    script_directory = os.path.dirname(os.path.abspath(__file__))
+def setup_logger(log_path, debug: bool = False, log_file_name: str = 'deletelog.txt') -> Tuple[logging.Logger, PrependingRotatingFileHandler]:
+    script_directory = os.path.dirname(os.path.abspath(__file__)) if not log_path else log_path
     log_file_path = os.path.join(script_directory, log_file_name)
     
     handler = PrependingRotatingFileHandler(log_file_path, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT)
@@ -53,10 +54,20 @@ def setup_logger(log_file_name: str = 'deletelog.txt') -> Tuple[logging.Logger, 
     handler.setFormatter(log_formatter)
     logger = logging.getLogger()
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+
+    if debug:
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
+
+    console_handler = logging.StreamHandler()
+    console_formatter = logging.Formatter('%(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+    
     return logger, handler
 
-def log_torrent_removal_info(torrents_info: List[Dict[str, Any]], logger: logging.Logger, test_mode: bool, bonus_rules: Dict[str, Dict[str, Any]], config: configparser.ConfigParser) -> None:
+def log_torrent_removal_info(torrents_info: List[Dict[str, Any]], logger: logging.Logger, bonus_rules: Dict[str, Dict[str, Any]], config: configparser.ConfigParser) -> None:
     if not torrents_info:
         logger.info("No torrents to remove based on current rules.")
         return
@@ -67,15 +78,21 @@ def log_torrent_removal_info(torrents_info: List[Dict[str, Any]], logger: loggin
 
     for torrent_info in torrents_info:
         size_gb = torrent_info['size'] / BYTES_TO_GB
-        seeding_time_week = torrent_info['seeding_time'] / SECONDS_PER_WEEK
+        seeding_time_day = torrent_info['seeding_time'] / SECONDS_PER_DAY
         category = torrent_info.get('category', 'Unknown')
+        popularity = torrent_info.get('popularity')
+        eta = torrent_info.get('eta')
+        tracker = torrent_info.get('tracker')
 
         average_ratio_per_week = torrent_utils.calculate_average_ratio(torrent_info, log_file_path, logger, bonus_rules, config)
 
         truncated_name = (torrent_info['name'][:MAX_NAME_LENGTH - 3] + '...') if len(torrent_info['name']) > MAX_NAME_LENGTH else torrent_info['name']
 
         size_str = f"{size_gb:.2f} GB".rjust(10)
-        seeding_time_str = f"{seeding_time_week:.1f} Weeks".rjust(11)
+        seeding_time_str = f"{seeding_time_day:.1f} Days".rjust(11)
         ratio_week_str = f"{average_ratio_per_week:.3f} R/W".rjust(11)
+        popularity_str = f"{popularity:.2f} pop".rjust(6) if popularity else "N/A".rjust(6)
+        eta_str = f"{eta} ETA".rjust(7)
+        tracker_str = f"{tracker[8:24]}" if tracker else "N/A".rjust(20)
 
-        logger.info(f"{truncated_name:<69}  \t{category} \t{size_str} \t{seeding_time_str} \t{ratio_week_str}")
+        logger.info(f"{truncated_name:<69}  \t{category} \t{size_str} \t{seeding_time_str} \t{ratio_week_str} \t {popularity_str} \t{eta_str} \t{tracker_str}")
