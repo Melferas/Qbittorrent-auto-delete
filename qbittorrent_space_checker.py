@@ -66,7 +66,7 @@ def main(logger: Logger, handler: Any, config: ConfigParser, session: requests.S
 
         sum_of_seeds = 0
         for torrent in all_torrents:
-            if "seeds" in torrent['category'] and torrent['eta'] == 0:
+            if any(category in torrent['category'] for category in ("seeds", "tv", "movies")) and torrent['eta'] == 0:
                 torrent_size = torrent['size'] / (1024 ** 3)
                 sum_of_seeds += torrent_size
         logger.info(f"Total size of completed seeds: {sum_of_seeds:.2f} GB")
