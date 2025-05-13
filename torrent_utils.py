@@ -77,6 +77,21 @@ def force_torrents(session: requests.Session, api_address: str, torrents: List[D
             logger.info(f"Test mode: Would force torrent {torrent['name']} in category {torrent['category']} to seed.")
         logger.info(f"Test mode: Would force torrents {hashList} to seed.")
 
+def reannounce_torrents(session: requests.Session, api_address: str, torrents: List[Dict[str, Any]], logger: Logger, test_mode: bool) -> None:
+    """reannounce torrents to seed."""
+    reannounce_url = f"{api_address}{API_V2_BASE}/torrents/reannounce"
+    hashList = '|'.join(torrent['hash'] for torrent in torrents)
+    if not test_mode:
+        data = {'hashes': hashList, 'value': 'true'}
+        response = session.post(reannounce_url, data=data)
+        response.raise_for_status()
+        logger.info(f"Torrents {hashList} reannounced.")
+    else:
+        for torrent in torrents:
+            logger.info(f"Test mode: Would reannounce torrent {torrent['name']} in category {torrent['category']}.")
+        logger.info(f"Test mode: Would reannounce torrents {hashList}.")
+
+
 def load_ratio_log(log_file_path: str) -> Dict[str, List[Dict[str, Any]]]:
     """Load ratio log from file."""
     try:
