@@ -7,9 +7,10 @@ import torrent_utils
 from configparser import ConfigParser
 import argparse
 
-def check_space_and_remove_torrents(session: requests.Session, logger: Logger, config: ConfigParser, test_mode: bool) -> None:
+def force_seed(session: requests.Session, logger: Logger, config: ConfigParser, test_mode: bool) -> None:
     api_address = config.get('login', 'address')
     categories_force = [cat.strip().lower() for cat in config.get('cleanup', 'categories_to_force_seed').split(',')]
+    tracker_names = [kw.strip().lower() for kw in config.get('cleanup', 'trackers_to_force_seed').split(',') if kw.strip()]
 
     for _ in range(2):  # Attempt twice: first try, then retry after login if unauthorized
         try:
@@ -28,14 +29,16 @@ def check_space_and_remove_torrents(session: requests.Session, logger: Logger, c
     for torrent in all_torrents:
         for category in categories_force:
             if torrent['category'].lower() == category:
-                filtered_torrents.append(torrent)
-                logger.debug(f"Torrent {torrent['name']} marked for force seeding in category: {category}")
+                if any(tracker_prefix in torrent['name'].lower() for tracker_prefix in tracker_names):
+                    filtered_torrents.append(torrent)
+                    logger.debug(f"Torrent {torrent['name']} marked for force seeding in category: {category} (matched keyword in name)")
+
 
     torrent_utils.force_torrents(session, api_address, filtered_torrents, logger, test_mode)
 
 def main(test_mode: bool, logger: Logger, handler: Any, config: ConfigParser, session: requests.Session) -> None:
     try:
-        check_space_and_remove_torrents(session, logger, config, test_mode)
+        force_seed(session, logger, config, test_mode)
     except Exception as e:
         logger.error(f"An error occurred: {e}")
     finally:
