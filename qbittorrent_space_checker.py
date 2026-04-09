@@ -1,39 +1,13 @@
 import os
 import requests
-from typing import Dict, Any
+from typing import Any
 from logging import Logger
 import logger_utils
 import torrent_utils
 from configparser import ConfigParser
 import argparse
 
-def check_space_and_remove_torrents(session: requests.Session, logger: Logger, config: ConfigParser, test_mode: bool) -> None:
-    api_address = config.get('login', 'address')
-    categories_force = [cat.strip().lower() for cat in config.get('cleanup', 'categories_to_force_seed').split(',')]
-
-    for _ in range(2):  # Attempt twice: first try, then retry after login if unauthorized
-        try:
-            all_torrents = torrent_utils.get_torrent_list(session, api_address, logger)
-            break  # Exit loop if successful
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 403 and _ == 0:  # Retry only on the first attempt
-                torrent_utils.login_to_qbittorrent(session, api_address, 
-                                                   config.get('login', 'username'), 
-                                                   config.get('login', 'password'), logger)
-            else:
-                raise
-
-    filtered_torrents = []
-    
-    for torrent in all_torrents:
-        for category in categories_force:
-            if torrent['category'].lower() == category:
-                filtered_torrents.append(torrent)
-                logger.debug(f"Torrent {torrent['name']} marked for force seeding in category: {category}")
-
-    torrent_utils.force_torrents(session, api_address, filtered_torrents, logger, test_mode)
-
-def main(logger: Logger, handler: Any, config: ConfigParser, session: requests.Session) -> None:
+def main(logger: Logger, handler: Any, config: ConfigParser, session: requests.Session, detail: bool = False, verbose: bool = False) -> None:
     try:
         api_address = config.get('login', 'address')
 
@@ -50,26 +24,62 @@ def main(logger: Logger, handler: Any, config: ConfigParser, session: requests.S
                     raise
         
         size_by_category = {}
+        size_by_tracker = {}
+        size_by_tracker_and_category = {}
+
         for torrent in all_torrents:
             torrent_size = torrent['size'] / (1024 ** 3)  # Convert size to GB
             category = torrent['category'].lower()
+            tracker = torrent.get('tracker', '').lower()
+
+            # By category
             size_by_category.setdefault(category, 0)
             size_by_category[category] += torrent_size
-            logger.info(f"Torrent {torrent['name']} size: {torrent_size:.2f} GB, category: {category}")
+
+            # By tracker
+            size_by_tracker.setdefault(tracker, 0)
+            size_by_tracker[tracker] += torrent_size
+
+            # By tracker and category
+            if tracker not in size_by_tracker_and_category:
+                size_by_tracker_and_category[tracker] = {}
+            size_by_tracker_and_category[tracker].setdefault(category, 0)
+            size_by_tracker_and_category[tracker][category] += torrent_size
+
+            if verbose:
+                logger.info(f"Torrent {torrent['name']} size: {torrent_size:.2f} GB, category: {category}, tracker: {tracker}")
+
+        sorted_trackers = sorted(size_by_tracker.items(), key=lambda x: x[1], reverse=True)
+        total_size = sum(size_by_category.values())
         
-        for category, size in size_by_category.items():
-            logger.info(f"Total size for category '{category}': {size:.2f} GB")
+        # Summary section
+        logger.info("=" * 60)
+        logger.info("TORRENT STORAGE SUMMARY")
+        logger.info("=" * 60)
+        logger.info(f"Total torrents: {len(all_torrents)}")
+        logger.info(f"Total size: {total_size:.2f} GB ({total_size/1024:.2f} TB)")
+        logger.info("")
 
-        suma = sum(size_by_category.values())
-        logger.info(f"Total size of torrents: {suma:.2f} GB")
+        # By category section
+        logger.info("=" * 60)
+        logger.info("BY CATEGORY")
+        logger.info("=" * 60)
+        for category, size in sorted(size_by_category.items()):
+            logger.info(f"{category:20s} {size:10.2f} GB")
+        logger.info("")
 
-
-        sum_of_seeds = 0
-        for torrent in all_torrents:
-            if any(category in torrent['category'] for category in ("seeds", "tv", "movies")) and torrent['eta'] == 0:
-                torrent_size = torrent['size'] / (1024 ** 3)
-                sum_of_seeds += torrent_size
-        logger.info(f"Total size of completed seeds: {sum_of_seeds:.2f} GB")
+        # By tracker section
+        logger.info("=" * 60)
+        logger.info("BY TRACKER")
+        logger.info("=" * 60)
+        for tracker, size in sorted_trackers:
+            logger.info(f"{tracker:20s} {size:10.2f} GB")
+            if detail:
+                cat_dict = size_by_tracker_and_category[tracker]
+                for category in sorted(cat_dict):
+                    cat_size = cat_dict[category]
+                    logger.info(f"  └─ {category:18s} {cat_size:10.2f} GB")
+        logger.info("")
 
     except Exception as e:
         logger.error(f"An error occurred: {e}")
@@ -78,8 +88,10 @@ def main(logger: Logger, handler: Any, config: ConfigParser, session: requests.S
         return 0
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Qbittorrent Force Seeding Script")
+    parser = argparse.ArgumentParser(description="Qbittorrent Space Checker Script")
     parser.add_argument('--config', type=str, help='Path to the configuration file')
+    parser.add_argument('--detail', action='store_true', help='Show detailed category-by-tracker breakdown')
+    parser.add_argument('--verbose', action='store_true', help='Show individual torrent details')
     args = parser.parse_args()
     config_path = args.config if args.config else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')
 
@@ -87,4 +99,4 @@ if __name__ == "__main__":
     config = torrent_utils.load_configuration(script_directory)
     logger, log_handler = logger_utils.setup_logger(config.get('logging', 'location', fallback=''), config.getboolean('logging', 'debug'))
     session = requests.Session()
-    main(logger, log_handler, config, session)
+    main(logger, log_handler, config, session, detail=args.detail, verbose=args.verbose)
