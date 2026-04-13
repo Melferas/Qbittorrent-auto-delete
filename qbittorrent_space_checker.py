@@ -3,14 +3,65 @@ import requests
 import time
 from typing import Any
 from logging import Logger
+from urllib.parse import urlparse
 import logger_utils
 import torrent_utils
 from configparser import ConfigParser
 import argparse
 
-def main(logger: Logger, handler: Any, config: ConfigParser, session: requests.Session, detail: bool = False, verbose: bool = False, enable_cross_report: bool = False, max_trackers: int = 10) -> None:
+COMMON_TRACKER_SUBDOMAINS = {'www', 'tracker', 'trackerprxy', 'announce', 'announcephp', 'a', 't', 'tr'}
+
+
+def normalize_tracker_url(raw_tracker: str) -> str:
+    if not raw_tracker:
+        return 'unknown'
+
+    parsed = urlparse(raw_tracker)
+    host = parsed.hostname or raw_tracker
+    host = host.lower().strip()
+
+    labels = host.split('.')
+    if len(labels) > 2 and labels[0] in COMMON_TRACKER_SUBDOMAINS:
+        host = '.'.join(labels[1:])
+
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+
+    return host
+
+
+def display_tracker_label(normalized_tracker: str, aliases: dict = None) -> str:
+    if aliases and normalized_tracker in aliases:
+        return aliases[normalized_tracker]
+    return normalized_tracker
+
+
+def load_tracker_aliases(config: ConfigParser) -> tuple:
+    """Load tracker aliases from config.
+    Returns: (tracker_to_alias_map, reverse_map_for_grouping)
+    """
+    tracker_to_alias = {}  # normalized_tracker -> canonical_name
+    alias_to_trackers = {}  # canonical_name -> [list of normalized trackers]
+    
+    if not config.has_section('tracker_aliases'):
+        return tracker_to_alias, alias_to_trackers
+    
+    for canonical_name in config.options('tracker_aliases'):
+        trackers_str = config.get('tracker_aliases', canonical_name)
+        tracked_list = [t.strip() for t in trackers_str.split(',')]
+        alias_to_trackers[canonical_name] = tracked_list
+        for tracker in tracked_list:
+            normalized = normalize_tracker_url(tracker)
+            tracker_to_alias[normalized] = canonical_name
+    
+    return tracker_to_alias, alias_to_trackers
+
+def main(logger: Logger, handler: Any, config: ConfigParser, session: requests.Session, detail: bool = False, verbose: bool = False, enable_cross_report: bool = False, max_trackers: int = 10, group_trackers: bool = True, use_aliases: bool = True) -> None:
     try:
         api_address = config.get('login', 'address')
+        
+        # Load tracker aliases
+        tracker_to_alias, alias_to_trackers = load_tracker_aliases(config) if use_aliases else ({}, {})
 
         for _ in range(2):  # Attempt twice: first try, then retry after login if unauthorized
             try:
@@ -25,27 +76,48 @@ def main(logger: Logger, handler: Any, config: ConfigParser, session: requests.S
                     raise
         
         size_by_category = {}
-        size_by_tracker = {}
+        size_by_tracker = {}  # Uses normalized or raw key based on group_trackers
         size_by_tracker_and_category = {}
+        count_by_tracker = {}
+        count_by_tracker_and_category = {}
+        tracker_key_map = {}  # Maps tracker to its raw URL for display purposes
 
         for torrent in all_torrents:
             torrent_size = torrent['size'] / (1024 ** 3)  # Convert size to GB
             category = torrent['category'].lower()
-            tracker = torrent.get('tracker', '').lower()
+            tracker_raw = torrent.get('tracker', '')
+            tracker_normalized = normalize_tracker_url(tracker_raw)
+            # Apply alias if available and grouping is enabled
+            if group_trackers and tracker_normalized in tracker_to_alias:
+                tracker_key = tracker_to_alias[tracker_normalized]
+            else:
+                tracker_key = tracker_normalized if group_trackers else tracker_raw.lower()
 
             # By category
             size_by_category.setdefault(category, 0)
             size_by_category[category] += torrent_size
 
             # By tracker
-            size_by_tracker.setdefault(tracker, 0)
-            size_by_tracker[tracker] += torrent_size
+            size_by_tracker.setdefault(tracker_key, 0)
+            size_by_tracker[tracker_key] += torrent_size
+            count_by_tracker.setdefault(tracker_key, 0)
+            count_by_tracker[tracker_key] += 1
+            
+            # Track raw URL for display when needed
+            if tracker_key not in tracker_key_map:
+                tracker_key_map[tracker_key] = tracker_raw
 
             # By tracker and category
-            if tracker not in size_by_tracker_and_category:
-                size_by_tracker_and_category[tracker] = {}
-            size_by_tracker_and_category[tracker].setdefault(category, 0)
-            size_by_tracker_and_category[tracker][category] += torrent_size
+            if tracker_key not in size_by_tracker_and_category:
+                size_by_tracker_and_category[tracker_key] = {}
+                count_by_tracker_and_category[tracker_key] = {}
+            size_by_tracker_and_category[tracker_key].setdefault(category, 0)
+            size_by_tracker_and_category[tracker_key][category] += torrent_size
+            count_by_tracker_and_category[tracker_key].setdefault(category, 0)
+            count_by_tracker_and_category[tracker_key][category] += 1
+
+            if verbose:
+                logger.info(f"Torrent {torrent['name']} size: {torrent_size:.2f} GB, category: {category}, tracker: {tracker_raw}")
 
             if verbose:
                 logger.info(f"Torrent {torrent['name']} size: {torrent_size:.2f} GB, category: {category}, tracker: {tracker}")
@@ -56,6 +128,10 @@ def main(logger: Logger, handler: Any, config: ConfigParser, session: requests.S
         for tracker, cat_dict in size_by_tracker_and_category.items():
             filtered_size_by_tracker_and_category[tracker] = {cat: size for cat, size in cat_dict.items() if cat not in exclude_categories}
         filtered_size_by_tracker = {tracker: sum(cat_dict.values()) for tracker, cat_dict in filtered_size_by_tracker_and_category.items()}
+        filtered_count_by_tracker_and_category = {}
+        for tracker, cat_dict in count_by_tracker_and_category.items():
+            filtered_count_by_tracker_and_category[tracker] = {cat: count for cat, count in cat_dict.items() if cat not in exclude_categories}
+        filtered_count_by_tracker = {tracker: sum(cat_dict.values()) for tracker, cat_dict in filtered_count_by_tracker_and_category.items()}
         total_size = sum(filtered_size_by_category.values())
         
         # Calculate top contributors for quick insights
@@ -100,16 +176,18 @@ def main(logger: Logger, handler: Any, config: ConfigParser, session: requests.S
         for i, (tracker, size) in enumerate(displayed_trackers):
             pct = (size / total_size) * 100 if total_size > 0 else 0
             marker = "🚨" if size > 500 else "📍"  # Warn if >500 GB
-            short_tracker = tracker[:50] + "..." if len(tracker) > 50 else tracker
-            logger.info(f"{marker} {short_tracker:50s} {size:10.2f} GB ({pct:5.1f}%)")
+            display_name = tracker  # tracker key already contains alias if applicable
+            short_tracker = display_name[:50] + "..." if len(display_name) > 50 else display_name
+            logger.info(f"{marker} {short_tracker:50s} {size:10.2f} GB ({pct:5.1f}%) - {filtered_count_by_tracker[tracker]} torrents")
             if detail:
                 cat_dict = filtered_size_by_tracker_and_category.get(tracker, {})
                 sorted_cats = sorted(cat_dict.items(), key=lambda x: x[1], reverse=True)
                 for cat, cat_size in sorted_cats[:3]:  # Top 3 categories per tracker
-                    logger.info(f"     └─ {cat:16s} {cat_size:10.2f} GB")
+                    logger.info(f"     └─ {cat:16s} {cat_size:10.2f} GB - {filtered_count_by_tracker_and_category[tracker][cat]} torrents")
                 if len(sorted_cats) > 3:
                     others_cat = sum(size for _, size in sorted_cats[3:])
-                    logger.info(f"     └─ ... {len(sorted_cats)-3} more: {others_cat:.2f} GB")
+                    others_count = sum(filtered_count_by_tracker_and_category[tracker][cat] for cat, _ in sorted_cats[3:])
+                    logger.info(f"     └─ ... {len(sorted_cats)-3} more: {others_cat:.2f} GB - {others_count} torrents")
         if max_trackers > 0 and len(sorted_trackers) > max_trackers:
             others_track = sum(size for _, size in sorted_trackers[max_trackers:])
             logger.info(f"   ... and {len(sorted_trackers)-max_trackers} more trackers: {others_track:.2f} GB")
@@ -131,6 +209,7 @@ if __name__ == "__main__":
     parser.add_argument('--verbose', action='store_true', help='Show individual torrent details')
     parser.add_argument('--enable-cross-report', action='store_true', help='Include cross-seed-link category in the report')
     parser.add_argument('--max-trackers', type=int, default=10, help='Maximum number of trackers to display (0 for all)')
+    parser.add_argument('--raw-trackers', action='store_true', help='Show raw tracker URLs instead of normalized tracker names')
     args = parser.parse_args()
     config_path = args.config if args.config else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')
 
@@ -138,4 +217,4 @@ if __name__ == "__main__":
     config = torrent_utils.load_configuration(script_directory)
     logger, log_handler = logger_utils.setup_logger(config.get('logging', 'location', fallback=''), config.getboolean('logging', 'debug'))
     session = requests.Session()
-    main(logger, log_handler, config, session, detail=args.detail, verbose=args.verbose, enable_cross_report=args.enable_cross_report, max_trackers=args.max_trackers)
+    main(logger, log_handler, config, session, detail=args.detail, verbose=args.verbose, enable_cross_report=args.enable_cross_report, max_trackers=args.max_trackers, group_trackers=not args.raw_trackers, use_aliases=True)
